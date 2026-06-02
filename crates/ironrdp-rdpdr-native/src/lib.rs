@@ -13,3 +13,8 @@
 mod nix;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use nix::backend;
+
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::backend;

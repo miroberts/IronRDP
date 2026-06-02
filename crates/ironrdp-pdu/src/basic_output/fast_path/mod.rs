@@ -15,6 +15,7 @@ use super::pointer::PointerUpdateData;
 use super::surface_commands::{SURFACE_COMMAND_HEADER_SIZE, SurfaceCommand};
 use crate::per;
 use crate::rdp::client_info::CompressionType;
+use crate::rdp::drawing_orders::{decode_order, DrawingOrder, DrawingOrderState};
 use crate::rdp::headers::{CompressionFlags, SHARE_DATA_HEADER_COMPRESSION_MASK};
 
 /// Implements the Fast-Path RDP message header PDU.
@@ -221,17 +222,155 @@ impl<'de> Decode<'de> for FastPathUpdatePdu<'de> {
     }
 }
 
-/// TS_FP_UPDATE data
+/// Fast-Path Palette Update data (TS_FP_PALETTEUPDATE).
+///
+/// This structure contains a color palette for 8bpp indexed color mode,
+/// sent via the fast-path channel. The palette defines the RGB values
+/// for up to 256 color indices.
+///
+/// # Wire Format
+///
+/// As specified in [MS-RDPBCGR 2.2.9.1.2.1.1]:
+/// - `updateType` (2 bytes): Must be `UPDATETYPE_PALETTE` (0x0002)
+/// - `pad2Octets` (2 bytes): Padding
+/// - `numberColors` (4 bytes): Number of palette entries
+/// - `paletteEntries` (variable): Array of RGB color entries
+///
+/// [MS-RDPBCGR 2.2.9.1.2.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastPathPaletteUpdate {
+    /// Color entries indexed by palette index (typically 256 entries)
+    pub entries: Vec<PaletteEntry>,
+}
+
+/// A single RGB color entry in a fast-path palette.
+///
+/// Used in [`FastPathPaletteUpdate`] to define colors for 8bpp indexed color mode.
+/// Each entry represents the RGB color value for a specific palette index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteEntry {
+    /// Red component (0-255)
+    pub red: u8,
+    /// Green component (0-255)
+    pub green: u8,
+    /// Blue component (0-255)
+    pub blue: u8,
+}
+
+impl<'de> Decode<'de> for FastPathPaletteUpdate {
+    fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
+        ensure_size!(in: src, size: 2);
+        let update_type = src.read_u16();
+        if update_type != 0x0002 {
+            return Err(invalid_field_err!("updateType", "expected UPDATETYPE_PALETTE (0x0002)"));
+        }
+
+        ensure_size!(in: src, size: 6);
+        let _pad = src.read_u16();
+        let number_colors = usize::try_from(src.read_u32())
+            .map_err(|_| invalid_field_err!("numberColors", "value too large"))?;
+
+        ensure_size!(in: src, size: number_colors * 3);
+        let mut entries = Vec::with_capacity(number_colors);
+        for _ in 0..number_colors {
+            entries.push(PaletteEntry {
+                red: src.read_u8(),
+                green: src.read_u8(),
+                blue: src.read_u8(),
+            });
+        }
+
+        Ok(Self { entries })
+    }
+}
+
+impl Encode for FastPathPaletteUpdate {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+        dst.write_u16(0x0002); // UPDATETYPE_PALETTE
+        dst.write_u16(0); // pad
+        dst.write_u32(cast_length!("numberColors", self.entries.len())?);
+        for entry in &self.entries {
+            dst.write_u8(entry.red);
+            dst.write_u8(entry.green);
+            dst.write_u8(entry.blue);
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "TS_FP_PALETTEUPDATE"
+    }
+
+    fn size(&self) -> usize {
+        2 + 2 + 4 + self.entries.len() * 3
+    }
+}
+
+/// Fast-Path Update data (TS_FP_UPDATE).
+///
+/// This enum represents the different types of graphics updates that can be
+/// received from an RDP server via the fast-path channel. Fast-path updates
+/// have lower overhead than slow-path (X224) updates.
+///
+/// # Variants
+///
+/// - `SurfaceCommands` - RemoteFX or NSCodec surface commands
+/// - `Bitmap` - Compressed or uncompressed bitmap data
+/// - `Pointer` - Mouse cursor updates (shape, position, visibility)
+/// - `Palette` - Color palette for 8bpp indexed color mode
+/// - `Synchronize` - Synchronization marker
+/// - `Orders` - Drawing orders (lines, rectangles, etc.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum FastPathUpdate<'a> {
+    /// Surface commands (RemoteFX, NSCodec, etc.)
     SurfaceCommands(Vec<SurfaceCommand<'a>>),
+    /// Bitmap update containing one or more screen region updates
     Bitmap(BitmapUpdateData<'a>),
+    /// Pointer (mouse cursor) update
     Pointer(PointerUpdateData<'a>),
-    /// Raw palette update data (TS_UPDATE_PALETTE_DATA).
-    /// Layout: pad(2) + numberColors(u32) + N x TS_COLOR_QUAD [B, G, R, pad].
-    /// See MS-RDPBCGR 2.2.9.1.1.3.1.1.
-    Palette(&'a [u8]),
+    /// Palette update for 8bpp indexed color mode
+    Palette(FastPathPaletteUpdate),
+    /// Synchronization marker (no payload)
+    Synchronize,
+    /// Drawing orders (lines, rectangles, text, etc.)
+    Orders(FastPathOrdersUpdate<'a>),
+}
+
+/// Fast-path orders update containing drawing commands.
+///
+/// This structure holds the raw order data and the number of orders.
+/// The actual order parsing is done lazily via the [`decode_orders`] method.
+///
+/// [`decode_orders`]: FastPathOrdersUpdate::decode_orders
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastPathOrdersUpdate<'a> {
+    /// Number of orders in this update
+    pub number_orders: u16,
+    /// Raw order data
+    pub order_data: &'a [u8],
+}
+
+impl<'a> FastPathOrdersUpdate<'a> {
+    /// Decode all orders from this update.
+    ///
+    /// This method parses the raw order data into individual [`DrawingOrder`]s.
+    /// The `state` parameter maintains order state between calls for delta encoding.
+    pub fn decode_orders(&self, state: &mut DrawingOrderState) -> DecodeResult<Vec<DrawingOrder<'a>>> {
+        let mut cursor = ReadCursor::new(self.order_data);
+        let capacity = usize::from(self.number_orders);
+        let mut orders = Vec::with_capacity(capacity);
+
+        for _ in 0..self.number_orders {
+            if cursor.is_empty() {
+                break;
+            }
+            orders.push(decode_order(&mut cursor, state)?);
+        }
+
+        Ok(orders)
+    }
 }
 
 impl<'a> FastPathUpdate<'a> {
@@ -253,11 +392,7 @@ impl<'a> FastPathUpdate<'a> {
                 Ok(Self::SurfaceCommands(commands))
             }
             UpdateCode::Bitmap => Ok(Self::Bitmap(decode_cursor(src)?)),
-            UpdateCode::Palette => {
-                let data = src.remaining();
-                src.advance(data.len());
-                Ok(Self::Palette(data))
-            }
+            UpdateCode::Palette => Ok(Self::Palette(decode_cursor(src)?)),
             UpdateCode::HiddenPointer => Ok(Self::Pointer(PointerUpdateData::SetHidden)),
             UpdateCode::DefaultPointer => Ok(Self::Pointer(PointerUpdateData::SetDefault)),
             UpdateCode::PositionPointer => Ok(Self::Pointer(PointerUpdateData::SetPosition(decode_cursor(src)?))),
@@ -268,7 +403,26 @@ impl<'a> FastPathUpdate<'a> {
             UpdateCode::CachedPointer => Ok(Self::Pointer(PointerUpdateData::Cached(decode_cursor(src)?))),
             UpdateCode::NewPointer => Ok(Self::Pointer(PointerUpdateData::New(decode_cursor(src)?))),
             UpdateCode::LargePointer => Ok(Self::Pointer(PointerUpdateData::Large(decode_cursor(src)?))),
-            _ => Err(invalid_field_err!("updateCode", "unsupported fast-path update code")),
+            UpdateCode::Synchronize => Ok(Self::Synchronize),
+            UpdateCode::Orders => {
+                // Orders update format:
+                // - updateType (2 bytes): 0x0000 for UPDATETYPE_ORDERS
+                // - pad2OctetsA (2 bytes)
+                // - numberOrders (2 bytes)
+                // - pad2OctetsB (2 bytes)
+                // - orderData (variable)
+                ensure_size!(in: src, size: 8);
+                let _update_type = src.read_u16();
+                let _pad = src.read_u16();
+                let number_orders = src.read_u16();
+                let _pad = src.read_u16();
+                let order_data = src.remaining();
+
+                Ok(Self::Orders(FastPathOrdersUpdate {
+                    number_orders,
+                    order_data,
+                }))
+            }
         }
     }
 
@@ -278,6 +432,8 @@ impl<'a> FastPathUpdate<'a> {
             Self::Bitmap(_) => "Bitmap",
             Self::Pointer(_) => "Pointer",
             Self::Palette(_) => "Palette",
+            Self::Synchronize => "Synchronize",
+            Self::Orders(_) => "Orders",
         }
     }
 }
@@ -304,8 +460,18 @@ impl Encode for FastPathUpdate<'_> {
                 PointerUpdateData::New(inner) => inner.encode(dst)?,
                 PointerUpdateData::Large(inner) => inner.encode(dst)?,
             },
-            Self::Palette(data) => {
-                dst.write_slice(data);
+            Self::Palette(palette) => {
+                palette.encode(dst)?;
+            }
+            Self::Synchronize => {
+                // Synchronize has no data
+            }
+            Self::Orders(orders) => {
+                dst.write_u16(0x0000); // UPDATETYPE_ORDERS
+                dst.write_u16(0); // pad
+                dst.write_u16(orders.number_orders);
+                dst.write_u16(0); // pad
+                dst.write_slice(orders.order_data);
             }
         }
 
@@ -320,7 +486,7 @@ impl Encode for FastPathUpdate<'_> {
         match self {
             Self::SurfaceCommands(commands) => commands.iter().map(|c| c.size()).sum::<usize>(),
             Self::Bitmap(bitmap) => bitmap.size(),
-            Self::Palette(data) => data.len(),
+            Self::Palette(palette) => palette.size(),
             Self::Pointer(pointer) => match pointer {
                 PointerUpdateData::SetHidden => 0,
                 PointerUpdateData::SetDefault => 0,
@@ -330,6 +496,8 @@ impl Encode for FastPathUpdate<'_> {
                 PointerUpdateData::New(inner) => inner.size(),
                 PointerUpdateData::Large(inner) => inner.size(),
             },
+            Self::Synchronize => 0,
+            Self::Orders(orders) => 8 + orders.order_data.len(), // header + data
         }
     }
 }
@@ -377,6 +545,8 @@ impl From<&FastPathUpdate<'_>> for UpdateCode {
                 PointerUpdateData::New(_) => Self::NewPointer,
                 PointerUpdateData::Large(_) => Self::LargePointer,
             },
+            FastPathUpdate::Synchronize => Self::Synchronize,
+            FastPathUpdate::Orders(_) => Self::Orders,
         }
     }
 }

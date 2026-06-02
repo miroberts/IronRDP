@@ -24,7 +24,59 @@ use ironrdp_pdu::pointer::{ColorPointerAttribute, LargePointerAttribute, Pointer
 
 use crate::color_conversion::rdp_16bit_to_rgb;
 
-const SUPPORTED_COLOR_BPP: [u16; 4] = [1, 16, 24, 32];
+const SUPPORTED_COLOR_BPP: [u16; 5] = [1, 8, 16, 24, 32];
+
+/// Color palette for 8bpp indexed pointer colors.
+///
+/// When decoding pointers with 8 bits-per-pixel color depth, each pixel value
+/// is an index into this 256-entry color palette.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct PointerPalette {
+    /// RGB entries indexed by palette index (0-255)
+    entries: [[u8; 3]; 256],
+}
+
+impl Default for PointerPalette {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PointerPalette {
+    /// Creates a new palette initialized with grayscale colors.
+    pub fn new() -> Self {
+        let mut entries = [[0u8; 3]; 256];
+        for (i, entry) in entries.iter_mut().enumerate() {
+            #[expect(clippy::cast_possible_truncation, clippy::as_conversions)]
+            let gray = i as u8; // i is bounded by 256, so truncation is safe
+            *entry = [gray, gray, gray];
+        }
+        Self { entries }
+    }
+
+    /// Creates a palette from an array of RGB entries.
+    pub fn from_entries(entries: [[u8; 3]; 256]) -> Self {
+        Self { entries }
+    }
+
+    /// Returns the RGB color for the given palette index.
+    #[inline]
+    pub fn get(&self, index: u8) -> [u8; 3] {
+        self.entries[usize::from(index)]
+    }
+
+    /// Updates palette entries from a slice of RGB values.
+    ///
+    /// Each entry should be `[R, G, B]`. Updates start from index 0.
+    pub fn update_from_slice(&mut self, entries: &[[u8; 3]]) {
+        for (i, entry) in entries.iter().enumerate() {
+            if i < 256 {
+                self.entries[i] = *entry;
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum PointerError {
@@ -180,14 +232,97 @@ impl DecodedPointer {
         )
     }
 
+    /// Decodes a pointer attribute with an optional palette for 8bpp support.
+    ///
+    /// This is the same as [`decode_pointer_attribute`](Self::decode_pointer_attribute) but accepts
+    /// a palette for decoding 8bpp indexed color pointers.
+    pub fn decode_pointer_attribute_with_palette(
+        src: &PointerAttribute<'_>,
+        target: PointerBitmapTarget,
+        palette: Option<&PointerPalette>,
+    ) -> Result<Self, PointerError> {
+        Self::decode_pointer_with_palette(
+            PointerData {
+                width: src.color_pointer.width,
+                height: src.color_pointer.height,
+                xor_bpp: src.xor_bpp,
+                xor_mask: src.color_pointer.xor_mask,
+                and_mask: src.color_pointer.and_mask,
+                hot_spot_x: src.color_pointer.hot_spot.x,
+                hot_spot_y: src.color_pointer.hot_spot.y,
+            },
+            target,
+            palette,
+        )
+    }
+
+    /// Decodes a color pointer attribute with an optional palette for 8bpp support.
+    ///
+    /// This is the same as [`decode_color_pointer_attribute`](Self::decode_color_pointer_attribute) but accepts
+    /// a palette for decoding 8bpp indexed color pointers.
+    pub fn decode_color_pointer_attribute_with_palette(
+        src: &ColorPointerAttribute<'_>,
+        target: PointerBitmapTarget,
+        palette: Option<&PointerPalette>,
+    ) -> Result<Self, PointerError> {
+        Self::decode_pointer_with_palette(
+            PointerData {
+                width: src.width,
+                height: src.height,
+                xor_bpp: 24, // Color pointers are always 24bpp
+                xor_mask: src.xor_mask,
+                and_mask: src.and_mask,
+                hot_spot_x: src.hot_spot.x,
+                hot_spot_y: src.hot_spot.y,
+            },
+            target,
+            palette,
+        )
+    }
+
+    /// Decodes a large pointer attribute with an optional palette for 8bpp support.
+    ///
+    /// This is the same as [`decode_large_pointer_attribute`](Self::decode_large_pointer_attribute) but accepts
+    /// a palette for decoding 8bpp indexed color pointers.
+    pub fn decode_large_pointer_attribute_with_palette(
+        src: &LargePointerAttribute<'_>,
+        target: PointerBitmapTarget,
+        palette: Option<&PointerPalette>,
+    ) -> Result<Self, PointerError> {
+        Self::decode_pointer_with_palette(
+            PointerData {
+                width: src.width,
+                height: src.height,
+                xor_bpp: src.xor_bpp,
+                xor_mask: src.xor_mask,
+                and_mask: src.and_mask,
+                hot_spot_x: src.hot_spot.x,
+                hot_spot_y: src.hot_spot.y,
+            },
+            target,
+            palette,
+        )
+    }
+
     fn decode_pointer(data: PointerData<'_>, target: PointerBitmapTarget) -> Result<Self, PointerError> {
+        Self::decode_pointer_with_palette(data, target, None)
+    }
+
+    fn decode_pointer_with_palette(
+        data: PointerData<'_>,
+        target: PointerBitmapTarget,
+        palette: Option<&PointerPalette>,
+    ) -> Result<Self, PointerError> {
         if data.width == 0 || data.height == 0 {
             return Ok(Self::new_invisible());
         }
 
+        // 8bpp requires a palette
+        if data.xor_bpp == 8 && palette.is_none() {
+            return Err(PointerError::NotSupportedBpp { bpp: data.xor_bpp });
+        }
+
         if !SUPPORTED_COLOR_BPP.contains(&data.xor_bpp) {
-            // 8bpp indexed colors are not supported yet (palette messages are not implemented)
-            // Other unknown bpps are not supported either
             return Err(PointerError::NotSupportedBpp { bpp: data.xor_bpp });
         }
 
@@ -230,7 +365,7 @@ impl DecodedPointer {
                 (xor_stride_cursor, and_stride_cursor)
             };
 
-            let mut color_reader = ColorStrideReader::new(data.xor_bpp, xor_stride)?;
+            let mut color_reader = ColorStrideReader::new(data.xor_bpp, xor_stride, palette)?;
             let mut bitmask_reader = BitmaskStrideReader::new(and_stride);
 
             let compute_inverted_pixel = if target.should_invert_pixels_using_check_pattern() {
@@ -341,24 +476,26 @@ impl BitmaskStrideReader {
     }
 }
 
-enum ColorStrideReader {
+enum ColorStrideReader<'a> {
     Color {
-        /// INVARIANT: `bpp == 16 || bpp == 24 || bpp == 32`
+        /// INVARIANT: `bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32`
         bpp: u16,
         read_stide_bytes: usize,
         stride_data_bytes: usize,
         stride_padding: usize,
+        /// Palette for 8bpp mode (only used when bpp == 8)
+        palette: Option<&'a PointerPalette>,
     },
     Bitmask(BitmaskStrideReader),
 }
 
-impl ColorStrideReader {
-    fn new(bpp: u16, stride: Stride) -> Result<Self, PointerError> {
+impl<'a> ColorStrideReader<'a> {
+    fn new(bpp: u16, stride: Stride, palette: Option<&'a PointerPalette>) -> Result<Self, PointerError> {
         Ok(match bpp {
             1 => Self::Bitmask(BitmaskStrideReader::new(stride)),
             bpp => Self::Color {
                 bpp: {
-                    // Enforce the bpp == 16 || bpp == 24 || bpp == 32 invariant.
+                    // Enforce the bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32 invariant.
                     if !SUPPORTED_COLOR_BPP[1..].contains(&bpp) {
                         return Err(PointerError::NotSupportedBpp { bpp });
                     }
@@ -368,6 +505,7 @@ impl ColorStrideReader {
                 read_stide_bytes: 0,
                 stride_data_bytes: stride.data_bytes,
                 stride_padding: stride.padding,
+                palette,
             },
         })
     }
@@ -379,6 +517,7 @@ impl ColorStrideReader {
                 read_stide_bytes,
                 stride_data_bytes,
                 stride_padding,
+                palette,
             } => {
                 if read_stide_bytes == stride_data_bytes {
                     *read_stide_bytes = 0;
@@ -386,6 +525,17 @@ impl ColorStrideReader {
                 }
 
                 match bpp {
+                    8 => {
+                        *read_stide_bytes += 1;
+                        let index = cursor.read_u8();
+                        if let Some(pal) = palette {
+                            let [r, g, b] = pal.get(index);
+                            [r, g, b, 0xff]
+                        } else {
+                            // Fallback to grayscale if no palette
+                            [index, index, index, 0xff]
+                        }
+                    }
                     16 => {
                         *read_stide_bytes += 2;
                         let color_16bit = cursor.read_u16();
@@ -434,4 +584,83 @@ struct PointerData<'a> {
     and_mask: &'a [u8],
     hot_spot_x: u16,
     hot_spot_y: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pointer_palette_default() {
+        let palette = PointerPalette::new();
+        // Default is grayscale
+        assert_eq!(palette.get(0), [0, 0, 0]);
+        assert_eq!(palette.get(128), [128, 128, 128]);
+        assert_eq!(palette.get(255), [255, 255, 255]);
+    }
+
+    #[test]
+    fn test_pointer_palette_from_entries() {
+        let mut entries = [[0u8; 3]; 256];
+        entries[0] = [255, 0, 0]; // Red
+        entries[1] = [0, 255, 0]; // Green
+        entries[2] = [0, 0, 255]; // Blue
+
+        let palette = PointerPalette::from_entries(entries);
+        assert_eq!(palette.get(0), [255, 0, 0]);
+        assert_eq!(palette.get(1), [0, 255, 0]);
+        assert_eq!(palette.get(2), [0, 0, 255]);
+    }
+
+    #[test]
+    fn test_pointer_palette_update_from_slice() {
+        let mut palette = PointerPalette::new();
+        palette.update_from_slice(&[
+            [255, 0, 0], // Index 0: Red
+            [0, 255, 0], // Index 1: Green
+            [0, 0, 255], // Index 2: Blue
+        ]);
+
+        assert_eq!(palette.get(0), [255, 0, 0]);
+        assert_eq!(palette.get(1), [0, 255, 0]);
+        assert_eq!(palette.get(2), [0, 0, 255]);
+        // Remaining entries should be grayscale
+        assert_eq!(palette.get(3), [3, 3, 3]);
+    }
+
+    #[test]
+    fn test_decode_invisible_pointer() {
+        let pointer = DecodedPointer::new_invisible();
+        assert_eq!(pointer.width, 0);
+        assert_eq!(pointer.height, 0);
+        assert!(pointer.bitmap_data.is_empty());
+    }
+
+    #[test]
+    fn test_8bpp_requires_palette() {
+        // 8bpp without palette should fail
+        let data = PointerData {
+            width: 2,
+            height: 2,
+            xor_bpp: 8,
+            xor_mask: &[0, 1, 2, 3], // 2x2 pixels at 8bpp = 4 bytes
+            and_mask: &[0x00],       // 2 bits rounded up to 1 byte per row, 2 rows = but needs padding
+            hot_spot_x: 0,
+            hot_spot_y: 0,
+        };
+
+        let result = DecodedPointer::decode_pointer(data, PointerBitmapTarget::Software);
+        assert!(matches!(result, Err(PointerError::NotSupportedBpp { bpp: 8 })));
+    }
+
+    #[test]
+    fn test_supported_bpp_values() {
+        assert!(SUPPORTED_COLOR_BPP.contains(&1));
+        assert!(SUPPORTED_COLOR_BPP.contains(&8));
+        assert!(SUPPORTED_COLOR_BPP.contains(&16));
+        assert!(SUPPORTED_COLOR_BPP.contains(&24));
+        assert!(SUPPORTED_COLOR_BPP.contains(&32));
+        assert!(!SUPPORTED_COLOR_BPP.contains(&4));
+        assert!(!SUPPORTED_COLOR_BPP.contains(&15));
+    }
 }

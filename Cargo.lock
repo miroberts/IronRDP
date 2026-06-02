@@ -2877,6 +2877,7 @@ dependencies = [
 name = "ironrdp-session"
 version = "0.11.0"
 dependencies = [
+ "bytes",
  "ironrdp-bulk",
  "ironrdp-core",
  "ironrdp-displaycontrol",

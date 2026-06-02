@@ -614,6 +614,7 @@ impl DecodedImage {
             return Ok(InclusiveRectangle::empty());
         }
 
+
         const SRC_COLOR_DEPTH: usize = 2;
         const DST_COLOR_DEPTH: usize = 4;
 
@@ -703,22 +704,14 @@ impl DecodedImage {
         Ok(update_rectangle)
     }
 
-    /// Apply an 8-bit palette-indexed bitmap. Each source byte is a palette index.
-    /// Bottom-up row order.
-    pub(crate) fn apply_rgb8_with_palette(
+    /// Apply an 8bpp indexed color bitmap using the provided palette.
+    pub(crate) fn apply_indexed8_bitmap(
         &mut self,
-        indexed: &[u8],
+        indexed8: &[u8],
+        palette: &crate::fast_path::ColorPalette,
         update_rectangle: &InclusiveRectangle,
-        palette: &[[u8; 3]; 256],
     ) -> SessionResult<InclusiveRectangle> {
-        if !self.rect_fits(update_rectangle) {
-            debug!(
-                "Skipping rgb8 update {:?} outside image bounds {}x{}",
-                update_rectangle, self.width, self.height,
-            );
-            return Ok(InclusiveRectangle::empty());
-        }
-
+        const SRC_COLOR_DEPTH: usize = 1;
         const DST_COLOR_DEPTH: usize = 4;
 
         let image_width = usize::from(self.width);
@@ -729,14 +722,14 @@ impl DecodedImage {
 
         let pointer_rendering_state = self.pointer_rendering_begin(update_rectangle)?;
 
-        indexed
-            .chunks_exact(rectangle_width)
+        indexed8
+            .chunks_exact(rectangle_width * SRC_COLOR_DEPTH)
             .rev()
             .enumerate()
             .for_each(|(row_idx, row)| {
-                row.iter().enumerate().for_each(|(col_idx, &index)| {
+                row.iter().enumerate().for_each(|(col_idx, &palette_index)| {
                     let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
-                    let [r, g, b] = palette[usize::from(index)];
+                    let [r, g, b] = palette.get(palette_index);
                     self.data[dst_idx + ri] = r;
                     self.data[dst_idx + gi] = g;
                     self.data[dst_idx + bi] = b;
@@ -940,5 +933,442 @@ impl DecodedImage {
         let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
 
         Ok(update_rectangle)
+    }
+
+    /// Fill a rectangle with a solid RGBA color.
+    ///
+    /// This is used for drawing order operations like DstBlt, OpaqueRect, and PatBlt.
+    // FIXME: this assumes PixelFormat::RgbA32
+    pub(crate) fn fill_rectangle(
+        &mut self,
+        rect: &InclusiveRectangle,
+        color: [u8; 4],
+    ) -> SessionResult<InclusiveRectangle> {
+        const DST_COLOR_DEPTH: usize = 4;
+
+        let image_width = usize::from(self.width);
+        let rect_width = usize::from(rect.width());
+        let rect_height = usize::from(rect.height());
+        let top = usize::from(rect.top);
+        let left = usize::from(rect.left);
+
+        let pointer_rendering_state = self.pointer_rendering_begin(rect)?;
+
+        for row_idx in 0..rect_height {
+            for col_idx in 0..rect_width {
+                let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
+                if dst_idx + DST_COLOR_DEPTH <= self.data.len() {
+                    self.data[dst_idx] = color[0]; // R
+                    self.data[dst_idx + 1] = color[1]; // G
+                    self.data[dst_idx + 2] = color[2]; // B
+                    self.data[dst_idx + 3] = color[3]; // A
+                }
+            }
+        }
+
+        let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
+        Ok(update_rectangle)
+    }
+
+    /// Copy a rectangle from one location to another within the image.
+    ///
+    /// This is used for ScrBlt (screen block transfer) operations.
+    /// Handles overlapping regions correctly by using an intermediate buffer.
+    // FIXME: this assumes PixelFormat::RgbA32
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_sign_loss,
+        reason = "Coordinates are clamped to non-negative before casting to usize"
+    )]
+    pub(crate) fn copy_rectangle(
+        &mut self,
+        src_x: i16,
+        src_y: i16,
+        dst_rect: &InclusiveRectangle,
+    ) -> SessionResult<InclusiveRectangle> {
+        const COLOR_DEPTH: usize = 4;
+
+        let image_width = usize::from(self.width);
+        let image_height = usize::from(self.height);
+        let rect_width = usize::from(dst_rect.width());
+        let rect_height = usize::from(dst_rect.height());
+
+        // Convert coordinates, clamping to valid range
+        let src_x = src_x.max(0) as usize;
+        let src_y = src_y.max(0) as usize;
+        let dst_x = usize::from(dst_rect.left);
+        let dst_y = usize::from(dst_rect.top);
+
+        // Calculate actual copy dimensions (clamp to image bounds)
+        let copy_width = rect_width
+            .min(image_width.saturating_sub(src_x))
+            .min(image_width.saturating_sub(dst_x));
+        let copy_height = rect_height
+            .min(image_height.saturating_sub(src_y))
+            .min(image_height.saturating_sub(dst_y));
+
+        if copy_width == 0 || copy_height == 0 {
+            return Ok(dst_rect.clone());
+        }
+
+        let pointer_rendering_state = self.pointer_rendering_begin(dst_rect)?;
+
+        // Copy to intermediate buffer to handle overlapping regions
+        let mut buffer = vec![0u8; copy_width * copy_height * COLOR_DEPTH];
+
+        // Copy source to buffer
+        for row in 0..copy_height {
+            let src_row_start = ((src_y + row) * image_width + src_x) * COLOR_DEPTH;
+            let buf_row_start = row * copy_width * COLOR_DEPTH;
+            let row_bytes = copy_width * COLOR_DEPTH;
+
+            if src_row_start + row_bytes <= self.data.len() {
+                buffer[buf_row_start..buf_row_start + row_bytes]
+                    .copy_from_slice(&self.data[src_row_start..src_row_start + row_bytes]);
+            }
+        }
+
+        // Copy buffer to destination
+        for row in 0..copy_height {
+            let dst_row_start = ((dst_y + row) * image_width + dst_x) * COLOR_DEPTH;
+            let buf_row_start = row * copy_width * COLOR_DEPTH;
+            let row_bytes = copy_width * COLOR_DEPTH;
+
+            if dst_row_start + row_bytes <= self.data.len() {
+                self.data[dst_row_start..dst_row_start + row_bytes]
+                    .copy_from_slice(&buffer[buf_row_start..buf_row_start + row_bytes]);
+            }
+        }
+
+        let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
+        Ok(update_rectangle)
+    }
+
+    /// Invert all pixels in a rectangle.
+    ///
+    /// This is used for DSTINVERT ROP operations.
+    // FIXME: this assumes PixelFormat::RgbA32
+    pub(crate) fn invert_rectangle(&mut self, rect: &InclusiveRectangle) -> SessionResult<InclusiveRectangle> {
+        const COLOR_DEPTH: usize = 4;
+
+        let image_width = usize::from(self.width);
+        let rect_width = usize::from(rect.width());
+        let rect_height = usize::from(rect.height());
+        let top = usize::from(rect.top);
+        let left = usize::from(rect.left);
+
+        let pointer_rendering_state = self.pointer_rendering_begin(rect)?;
+
+        for row_idx in 0..rect_height {
+            for col_idx in 0..rect_width {
+                let idx = ((top + row_idx) * image_width + left + col_idx) * COLOR_DEPTH;
+                if idx + COLOR_DEPTH <= self.data.len() {
+                    self.data[idx] = 255 - self.data[idx]; // R
+                    self.data[idx + 1] = 255 - self.data[idx + 1]; // G
+                    self.data[idx + 2] = 255 - self.data[idx + 2]; // B
+                                                                   // Alpha stays the same
+                }
+            }
+        }
+
+        let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
+        Ok(update_rectangle)
+    }
+
+    /// Draw a line using Bresenham's algorithm.
+    ///
+    /// This is used for LineTo and Polyline operations.
+    // FIXME: this assumes PixelFormat::RgbA32
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "Line coordinates are clamped to screen bounds before casting"
+    )]
+    pub(crate) fn draw_line(
+        &mut self,
+        x0: i16,
+        y0: i16,
+        x1: i16,
+        y1: i16,
+        color: [u8; 4],
+    ) -> SessionResult<InclusiveRectangle> {
+        const COLOR_DEPTH: usize = 4;
+
+        let image_width = usize::from(self.width);
+        let image_height = usize::from(self.height);
+
+        // Calculate bounding rectangle for the line
+        let rect = InclusiveRectangle {
+            left: x0.min(x1).max(0) as u16,
+            top: y0.min(y1).max(0) as u16,
+            right: x0.max(x1).min(self.width as i16 - 1).max(0) as u16,
+            bottom: y0.max(y1).min(self.height as i16 - 1).max(0) as u16,
+        };
+
+        let pointer_rendering_state = self.pointer_rendering_begin(&rect)?;
+
+        // Bresenham's line algorithm
+        let mut x = i32::from(x0);
+        let mut y = i32::from(y0);
+        let x1 = i32::from(x1);
+        let y1 = i32::from(y1);
+
+        let dx = (x1 - x).abs();
+        let dy = -(y1 - y).abs();
+        let sx = if x < x1 { 1 } else { -1 };
+        let sy = if y < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            // Plot pixel if within bounds
+            if x >= 0 && (x as usize) < image_width && y >= 0 && (y as usize) < image_height {
+                let idx = (y as usize * image_width + x as usize) * COLOR_DEPTH;
+                if idx + COLOR_DEPTH <= self.data.len() {
+                    self.data[idx] = color[0];
+                    self.data[idx + 1] = color[1];
+                    self.data[idx + 2] = color[2];
+                    self.data[idx + 3] = color[3];
+                }
+            }
+
+            if x == x1 && y == y1 {
+                break;
+            }
+
+            let e2 = 2 * err;
+            if e2 >= dy {
+                if x == x1 {
+                    break;
+                }
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                if y == y1 {
+                    break;
+                }
+                err += dx;
+                y += sy;
+            }
+        }
+
+        let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
+        Ok(update_rectangle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_image(width: u16, height: u16) -> DecodedImage {
+        DecodedImage::new(PixelFormat::RgbA32, width, height)
+    }
+
+    #[test]
+    fn test_fill_rectangle() {
+        let mut image = create_test_image(100, 100);
+
+        let rect = InclusiveRectangle {
+            left: 10,
+            top: 10,
+            right: 19,
+            bottom: 19,
+        };
+
+        let result = image.fill_rectangle(&rect, [255, 128, 64, 255]);
+        assert!(result.is_ok());
+
+        // Check a pixel inside the rectangle
+        let idx = (10 * 100 + 10) * 4;
+        assert_eq!(image.data[idx], 255); // R
+        assert_eq!(image.data[idx + 1], 128); // G
+        assert_eq!(image.data[idx + 2], 64); // B
+        assert_eq!(image.data[idx + 3], 255); // A
+
+        // Check a pixel outside the rectangle is still black (default)
+        let idx = (0 * 100 + 0) * 4;
+        assert_eq!(image.data[idx], 0); // R
+        assert_eq!(image.data[idx + 1], 0); // G
+        assert_eq!(image.data[idx + 2], 0); // B
+        assert_eq!(image.data[idx + 3], 0); // A
+    }
+
+    #[test]
+    fn test_copy_rectangle() {
+        let mut image = create_test_image(100, 100);
+
+        // First fill a source rectangle with a color
+        let src_rect = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 9,
+            bottom: 9,
+        };
+        image.fill_rectangle(&src_rect, [255, 0, 0, 255]).unwrap();
+
+        // Copy to a different location
+        let dst_rect = InclusiveRectangle {
+            left: 50,
+            top: 50,
+            right: 59,
+            bottom: 59,
+        };
+
+        let result = image.copy_rectangle(0, 0, &dst_rect);
+        assert!(result.is_ok());
+
+        // Check destination has the copied color
+        let idx = (50 * 100 + 50) * 4;
+        assert_eq!(image.data[idx], 255); // R
+        assert_eq!(image.data[idx + 1], 0); // G
+        assert_eq!(image.data[idx + 2], 0); // B
+        assert_eq!(image.data[idx + 3], 255); // A
+    }
+
+    #[test]
+    fn test_copy_rectangle_overlapping() {
+        let mut image = create_test_image(100, 100);
+
+        // Fill first 10 columns with different colors per column
+        for x in 0..10u16 {
+            let rect = InclusiveRectangle {
+                left: x,
+                top: 0,
+                right: x,
+                bottom: 9,
+            };
+            let color = (x * 25) as u8;
+            image.fill_rectangle(&rect, [color, color, color, 255]).unwrap();
+        }
+
+        // Copy overlapping: shift right by 5 pixels
+        let dst_rect = InclusiveRectangle {
+            left: 5,
+            top: 0,
+            right: 14,
+            bottom: 9,
+        };
+
+        let result = image.copy_rectangle(0, 0, &dst_rect);
+        assert!(result.is_ok());
+
+        // The copy should work correctly even with overlap
+        // At x=5, we should see what was at x=0 (color 0)
+        let idx = (0 * 100 + 5) * 4;
+        assert_eq!(image.data[idx], 0); // Was at x=0
+
+        // At x=10, we should see what was at x=5 (color 125)
+        let idx = (0 * 100 + 10) * 4;
+        assert_eq!(image.data[idx], 125); // Was at x=5
+    }
+
+    #[test]
+    fn test_invert_rectangle() {
+        let mut image = create_test_image(100, 100);
+
+        // Fill with a known color
+        let rect = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 9,
+            bottom: 9,
+        };
+        image.fill_rectangle(&rect, [100, 150, 200, 255]).unwrap();
+
+        // Invert
+        let result = image.invert_rectangle(&rect);
+        assert!(result.is_ok());
+
+        // Check inverted values: 255 - original
+        let idx = (0 * 100 + 0) * 4;
+        assert_eq!(image.data[idx], 155); // 255 - 100
+        assert_eq!(image.data[idx + 1], 105); // 255 - 150
+        assert_eq!(image.data[idx + 2], 55); // 255 - 200
+        assert_eq!(image.data[idx + 3], 255); // Alpha unchanged
+    }
+
+    #[test]
+    fn test_draw_line_horizontal() {
+        let mut image = create_test_image(100, 100);
+
+        let result = image.draw_line(10, 50, 90, 50, [255, 0, 0, 255]);
+        assert!(result.is_ok());
+
+        let rect = result.unwrap();
+        assert_eq!(rect.left, 10);
+        assert_eq!(rect.right, 90);
+        assert_eq!(rect.top, 50);
+        assert_eq!(rect.bottom, 50);
+
+        // Check some pixels on the line
+        let idx = (50 * 100 + 50) * 4;
+        assert_eq!(image.data[idx], 255);
+        assert_eq!(image.data[idx + 1], 0);
+        assert_eq!(image.data[idx + 2], 0);
+    }
+
+    #[test]
+    fn test_draw_line_vertical() {
+        let mut image = create_test_image(100, 100);
+
+        let result = image.draw_line(50, 10, 50, 90, [0, 255, 0, 255]);
+        assert!(result.is_ok());
+
+        let rect = result.unwrap();
+        assert_eq!(rect.left, 50);
+        assert_eq!(rect.right, 50);
+        assert_eq!(rect.top, 10);
+        assert_eq!(rect.bottom, 90);
+    }
+
+    #[test]
+    fn test_draw_line_diagonal() {
+        let mut image = create_test_image(100, 100);
+
+        let result = image.draw_line(0, 0, 50, 50, [0, 0, 255, 255]);
+        assert!(result.is_ok());
+
+        let rect = result.unwrap();
+        assert_eq!(rect.left, 0);
+        assert_eq!(rect.right, 50);
+        assert_eq!(rect.top, 0);
+        assert_eq!(rect.bottom, 50);
+
+        // Check that (25, 25) is on the line
+        let idx = (25 * 100 + 25) * 4;
+        assert_eq!(image.data[idx], 0);
+        assert_eq!(image.data[idx + 1], 0);
+        assert_eq!(image.data[idx + 2], 255);
+    }
+
+    #[test]
+    fn test_draw_line_reverse() {
+        let mut image = create_test_image(100, 100);
+
+        // Draw from bottom-right to top-left
+        let result = image.draw_line(90, 90, 10, 10, [255, 255, 0, 255]);
+        assert!(result.is_ok());
+
+        // Check that (50, 50) is on the line
+        let idx = (50 * 100 + 50) * 4;
+        assert_eq!(image.data[idx], 255);
+        assert_eq!(image.data[idx + 1], 255);
+        assert_eq!(image.data[idx + 2], 0);
+    }
+
+    #[test]
+    fn test_draw_line_clipping() {
+        let mut image = create_test_image(100, 100);
+
+        // Line that goes partially outside image bounds
+        let result = image.draw_line(-10, 50, 110, 50, [255, 0, 0, 255]);
+        assert!(result.is_ok());
+
+        // Should clip to image bounds
+        let rect = result.unwrap();
+        assert!(rect.left <= 0);
+        assert!(rect.right <= 99);
     }
 }

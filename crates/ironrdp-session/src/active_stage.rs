@@ -11,7 +11,7 @@ use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
 use ironrdp_pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
-use ironrdp_pdu::slow_path::{self, GraphicsUpdateType};
+use ironrdp_pdu::slow_path;
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
 use tracing::{debug, info, warn};
@@ -177,17 +177,29 @@ impl ActiveStage {
                 )
             }
             Action::X224 => {
-                let x224_outputs = self.x224_processor.process(frame)?;
+                let outputs = self.x224_processor.process(frame)?;
                 let mut stage_outputs = Vec::new();
                 let mut processor_updates = Vec::new();
 
-                for output in x224_outputs {
+                for output in outputs {
                     match output {
-                        x224::ProcessorOutput::GraphicsUpdate(data) => {
-                            let updates = process_slow_path_graphics(&mut self.fast_path_processor, image, &data)?;
+                        x224::ProcessorOutput::SlowPathBitmap(data) => {
+                            let updates = self.fast_path_processor.process_slow_path_bitmap(image, &data)?;
                             processor_updates.extend(updates);
                         }
-                        x224::ProcessorOutput::PointerUpdate(data) => {
+                        x224::ProcessorOutput::PaletteUpdate(palette) => {
+                            self.fast_path_processor.update_palette(&palette);
+                        }
+                        x224::ProcessorOutput::SlowPathOrders {
+                            number_orders,
+                            order_data,
+                        } => {
+                            let updates =
+                                self.fast_path_processor
+                                    .process_slow_path_orders(image, number_orders, &order_data)?;
+                            processor_updates.extend(updates);
+                        }
+                        x224::ProcessorOutput::SlowPathPointer(data) => {
                             let updates = process_slow_path_pointer(&mut self.fast_path_processor, image, &data)?;
                             processor_updates.extend(updates);
                         }
@@ -392,11 +404,19 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
             x224::ProcessorOutput::DeactivateAll => Ok(Self::DeactivateAll),
             x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
-            // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
-            // before reaching this conversion.
-            x224::ProcessorOutput::GraphicsUpdate(_) | x224::ProcessorOutput::PointerUpdate(_) => Err(
-                SessionError::general("slow-path graphics/pointer updates should be handled before this conversion"),
-            ),
+            // These are consumed in ActiveStage::process() before reaching this conversion.
+            x224::ProcessorOutput::SlowPathBitmap(_) => {
+                unreachable!("SlowPathBitmap should be handled directly in ActiveStage::process")
+            }
+            x224::ProcessorOutput::PaletteUpdate(_) => {
+                unreachable!("PaletteUpdate should be handled directly in ActiveStage::process")
+            }
+            x224::ProcessorOutput::SlowPathOrders { .. } => {
+                unreachable!("SlowPathOrders should be handled directly in ActiveStage::process")
+            }
+            x224::ProcessorOutput::SlowPathPointer(_) => {
+                unreachable!("SlowPathPointer should be handled directly in ActiveStage::process")
+            }
         }
     }
 }
@@ -423,37 +443,6 @@ impl GracefulDisconnectReason {
 impl core::fmt::Display for GracefulDisconnectReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.description())
-    }
-}
-
-/// Parse and process a slow-path graphics update through the shared bitmap pipeline.
-fn process_slow_path_graphics(
-    fast_path_processor: &mut fast_path::Processor,
-    image: &mut DecodedImage,
-    data: &[u8],
-) -> SessionResult<Vec<UpdateKind>> {
-    let mut src = ReadCursor::new(data);
-    let update_type = slow_path::read_graphics_update_type(&mut src).map_err(SessionError::decode)?;
-
-    match update_type {
-        GraphicsUpdateType::Bitmap => {
-            let bitmap = slow_path::decode_slow_path_bitmap(&mut src).map_err(SessionError::decode)?;
-            fast_path_processor.process_bitmap_update(image, bitmap)
-        }
-        GraphicsUpdateType::Orders => {
-            warn!("Slow-path drawing orders not supported (MS-RDPEGDI)");
-            Ok(Vec::new())
-        }
-        GraphicsUpdateType::Palette => {
-            warn!("Slow-path palette update not supported (8bpp)");
-            Ok(Vec::new())
-        }
-        // Synchronize is an artifact from the T.128 multipoint protocol
-        // and carries no data. Safe to ignore.
-        GraphicsUpdateType::Synchronize => {
-            debug!("Ignoring slow-path synchronize update");
-            Ok(Vec::new())
-        }
     }
 }
 

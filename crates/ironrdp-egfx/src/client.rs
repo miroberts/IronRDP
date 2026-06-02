@@ -259,6 +259,22 @@ pub trait GraphicsPipelineHandler: Send {
     /// surface ID, destination rectangle, and RGBA pixel data.
     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
 
+    /// Whether this handler needs decoded pixel data from the H.264 decoder.
+    ///
+    /// Return `false` to skip the decode→crop→[`on_bitmap_updated`] path entirely
+    /// after the raw compressed data has been captured. This avoids the pixel
+    /// buffer allocations for handlers that forward the raw H.264 stream directly
+    /// (e.g., WebRTC video track passthrough) and have no use for decoded RGBA.
+    ///
+    /// When `false`, [`H264Decoder::decode`] is still called so the implementation
+    /// can capture the compressed stream, but it may return a zero-size
+    /// [`DecodedFrame`] — the pipeline will not inspect or apply the pixel data.
+    ///
+    /// Defaults to `true` to preserve existing behaviour.
+    fn wants_decoded_bitmap(&self) -> bool {
+        true
+    }
+
     /// Called when a logical frame is complete
     ///
     /// All bitmap updates between the corresponding `StartFrame`
@@ -744,6 +760,12 @@ impl GraphicsPipelineClient {
         let frame = decoder
             .decode(stream.data)
             .map_err(|e| pdu_other_err!("H.264 decode", source: e))?;
+
+        // Skip crop and on_bitmap_updated for handlers that don't need decoded
+        // pixels (e.g., passthrough handlers that forward the raw stream to WebRTC).
+        if !self.handler.wants_decoded_bitmap() {
+            return Ok(());
+        }
 
         let dest_width = dest_rect.width();
         let dest_height = dest_rect.height();
